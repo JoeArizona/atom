@@ -1,5 +1,5 @@
 {CompositeDisposable, Emitter} = require 'event-kit'
-{Point} = require 'text-buffer'
+{Point, Range} = require 'text-buffer'
 _ = require 'underscore-plus'
 
 module.exports =
@@ -18,6 +18,8 @@ class TextEditorPresenter
     @disposables = new CompositeDisposable
     @emitter = new Emitter
     @charWidthsByScope = {}
+    @lineDecorationsByScreenRow = {}
+    @lineNumberDecorationsByScreenRow = {}
     @observeModel()
     @observeConfig()
     @buildState()
@@ -71,6 +73,8 @@ class TextEditorPresenter
     @updateState()
 
   updateState: ->
+    @refreshLineDecorationCaches()
+
     @updateHeightState()
     @updateVerticalScrollState()
     @updateHorizontalScrollState()
@@ -380,48 +384,18 @@ class TextEditorPresenter
     @getLineHeight() * @model.getScreenLineCount()
 
   lineDecorationClassesForRow: (row) ->
-    return null if @model.isMini()
-
-    decorationClasses = null
-    for markerId, decorations of @model.decorationsForScreenRowRange(row, row) when @model.getMarker(markerId).isValid()
-      for decoration in decorations when decoration.isType('line')
-        properties = decoration.getProperties()
-        range = decoration.getMarker().getScreenRange()
-
-        continue if properties.onlyHead and decoration.getMarker().getHeadScreenPosition().row isnt row
-        continue unless range.intersectsRow(row)
-        if range.isEmpty()
-          continue if properties.onlyNonEmpty
-        else
-          continue if properties.onlyEmpty
-          continue if row is range.end.row and range.end.column is 0
-
-        decorationClasses ?= []
-        decorationClasses.push(properties.class)
-
-    decorationClasses
+    classes = null
+    for id, decoration of @lineDecorationsByScreenRow[row]
+      classes ?= []
+      classes.push(decoration.getProperties().class)
+    classes
 
   lineNumberDecorationClassesForRow: (row) ->
-    return null if @model.isMini()
-
-    decorationClasses = null
-    for markerId, decorations of @model.decorationsForScreenRowRange(row, row) when @model.getMarker(markerId).isValid()
-      for decoration in decorations when decoration.isType('line-number')
-        properties = decoration.getProperties()
-        range = decoration.getMarker().getScreenRange()
-
-        continue if properties.onlyHead and decoration.getMarker().getHeadScreenPosition().row isnt row
-        continue unless range.intersectsRow(row)
-        if range.isEmpty()
-          continue if properties.onlyNonEmpty
-        else
-          continue if properties.onlyEmpty
-          continue if row is range.end.row and range.end.column is 0
-
-        decorationClasses ?= []
-        decorationClasses.push(properties.class)
-
-    decorationClasses
+    classes = null
+    for id, decoration of @lineNumberDecorationsByScreenRow[row]
+      classes ?= []
+      classes.push(decoration.getProperties().class)
+    classes
 
   getCursorBlinkPeriod: -> @cursorBlinkPeriod
 
@@ -435,6 +409,7 @@ class TextEditorPresenter
       @scrollTop = scrollTop
       @didStartScrolling()
       @updateVerticalScrollState()
+      @refreshLineDecorationCaches()
       @updateLinesState()
       @updateCursorsState()
       @updateHighlightsState()
@@ -492,6 +467,7 @@ class TextEditorPresenter
       @height = height
       @updateVerticalScrollState()
       @updateScrollbarsState()
+      @refreshLineDecorationCaches()
       @updateLinesState()
       @updateCursorsState()
       @updateHighlightsState()
@@ -529,6 +505,7 @@ class TextEditorPresenter
       @lineHeight = lineHeight
       @updateHeightState()
       @updateVerticalScrollState()
+      @refreshLineDecorationCaches()
       @updateLinesState()
       @updateCursorsState()
       @updateHighlightsState()
@@ -630,12 +607,20 @@ class TextEditorPresenter
     {top, left, width, height}
 
   observeLineDecoration: (decoration) ->
+    console.log "OBSERVE LINE DECORATION"
     decorationDisposables = new CompositeDisposable
-    decorationDisposables.add decoration.getMarker().onDidChange(@updateLinesState.bind(this))
+    decorationDisposables.add decoration.getMarker().onDidChange(@didChangeLineDecorationMarker.bind(this, decoration))
     decorationDisposables.add decoration.onDidDestroy =>
       @disposables.remove(decorationDisposables)
       @updateLinesState()
     @disposables.add(decorationDisposables)
+
+  didChangeLineDecorationMarker: (decoration, change) ->
+    oldRange = new Range(change.oldTailScreenPosition, change.oldHeadScreenPosition)
+    newRange = new Range(change.newTailScreenPosition, change.newHeadScreenPosition)
+    @removeLineDecorationFromRange(decoration, oldRange)
+    @addLineDecorationToRange(decoration, newRange)
+    @updateLinesState()
 
   observeLineNumberDecoration: (decoration) ->
     decorationDisposables = new CompositeDisposable
@@ -674,6 +659,7 @@ class TextEditorPresenter
 
   didAddDecoration: (decoration) ->
     if decoration.isType('line')
+      @addLineDecorationToRange(decoration, decoration.getMarker().getScreenRange())
       @observeLineDecoration(decoration)
       @updateLinesState()
     if decoration.isType('line-number')
@@ -724,3 +710,61 @@ class TextEditorPresenter
     @startBlinkingCursorsAfterDelay ?= _.debounce(@startBlinkingCursors, @getCursorBlinkResumeDelay())
     @startBlinkingCursorsAfterDelay()
     @emitter.emit 'did-update-state'
+
+  refreshLineDecorationCaches: ->
+    return unless @hasRequiredMeasurements()
+
+    @lineDecorationsByScreenRow = {}
+    @lineNumberDecorationsByScreenRow = {}
+
+    for markerId, decorations of @model.decorationsForScreenRowRange(@computeStartRow(), @computeEndRow() - 1)
+      marker = @model.getMarker(markerId)
+      continue unless marker.isValid()
+      range = marker.getScreenRange()
+
+      for decoration in decorations
+        if decoration.isType('line') or decoration.isType('line-number')
+          @addLineDecorationToRange(decoration, range)
+
+  addLineDecorationToRange: (decoration, decorationRange) ->
+    return if @model.isMini()
+
+    decorationRange ?= decoration.getMarker().getScreenRange()
+    properties = decoration.getProperties()
+    if decorationRange.isEmpty()
+      return if properties.onlyNonEmpty
+    else
+      return if properties.onlyEmpty
+
+    decorationStartRow = Math.max(decorationRange.start.row, @computeStartRow())
+    decorationEndRow = Math.min(decorationRange.end.row, @computeEndRow() - 1)
+
+    row = decorationStartRow
+    while row <= decorationEndRow
+      unless @shouldApplyLineDecorationToScreenRow(decoration, row)
+        row++
+        continue
+
+      if decoration.isType('line')
+        @lineDecorationsByScreenRow[row] ?= {}
+        @lineDecorationsByScreenRow[row][decoration.id] = decoration
+
+      if decoration.isType('line-number')
+        @lineNumberDecorationsByScreenRow[row] ?= {}
+        @lineNumberDecorationsByScreenRow[row][decoration.id] = decoration
+
+      row++
+
+  removeLineDecorationFromRange: (decoration, range) ->
+    startRow = Math.max(range.start.row, @computeStartRow())
+
+    for row in [range.start.row..range.end.row] by 1
+      delete @lineDecorationsByScreenRow[row][decoration.id]
+      delete @lineNumberDecorationsByScreenRow[row][decoration.id]
+
+  shouldApplyLineDecorationToScreenRow: (decoration, row) ->
+    properties = decoration.getProperties()
+    marker = decoration.getMarker()
+    headPosition = marker.getHeadScreenPosition()
+    endPosition = marker.getEndScreenPosition()
+    not ((properties.onlyHead and row isnt headPosition.row) or (row is endPosition.row and endPosition.column is 0))
